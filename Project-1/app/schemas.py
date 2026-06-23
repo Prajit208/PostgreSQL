@@ -1,5 +1,5 @@
-import datetime
-from pydantic import BaseModel, ConfigDict
+from datetime import datetime
+from pydantic import BaseModel, ConfigDict,EmailStr
 from typing import Optional
 
 # class Post(BaseModel):
@@ -48,3 +48,19 @@ class ResponseBase(PostBase):
     # off an object's attributes instead, e.g. new_post.title, new_post.content
     # this is what lets us return a raw SQLAlchemy model instance (new_post) from the
     # route and have FastAPI correctly convert it into this response schema
+    
+class UserBase(BaseModel):
+    email: EmailStr
+      
+    
+class CreateUser(UserBase):
+    password: str   
+
+class UserOut(UserBase): # user response model
+    id: int
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+    
+class UserLogin(BaseModel):
+    email: EmailStr
+    password:str    
