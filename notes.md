@@ -135,3 +135,126 @@ updated = db.query(models.Post).filter(models.Post.id == id).first()
 3. Including `created_at` as an optional field on the request body schema meant an update request that did not send `created_at` would default it to `None`, and `.update()` would then overwrite the real timestamp with null. Fields the client should never set, like `created_at` or `id`, should not exist on the request schema at all.
 4. `not post` and `post is None` behave identically when `post` can only ever be a model instance or `None`, since model instances are always truthy. They differ for genuinely falsy non None values like `0` or `""`, so `is None` is the more precise way to write the intent when checking query results.
 
+## Pydantic schemas and response models
+ 
+Schemas were split using inheritance instead of duplicating fields across separate unrelated classes:
+```python
+class PostBase(BaseModel):
+    title: str
+    content: str
+    published: bool = True
+ 
+class CreatePost(PostBase):
+    pass
+ 
+class UpdatePost(PostBase):
+    pass
+ 
+class ResponseBase(PostBase):
+    id: int
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+```
+* `PostBase` holds the fields every variant shares.
+* `CreatePost` and `UpdatePost` are request schemas, only fields the client should ever send. They deliberately exclude `id` and `created_at`, since the client never sets those.
+* `ResponseBase` is a response schema, it adds `id` and `created_at` on top of the shared base, since those exist on the actual database row and are useful for the client to receive back, even though the client never sent them.
+* `model_config = ConfigDict(from_attributes=True)` tells Pydantic it is allowed to build this schema by reading attributes directly off an object (like `new_post.title`), not just from a dict. Without this, returning a raw SQLAlchemy model instance from a route would fail validation, since Pydantic by default expects dict like input.
+* `response_model=schemas.ResponseBase` on a route filters and validates the returned object down to exactly the fields declared on that schema, anything not declared there gets silently dropped from the response, even if the underlying object has it.
+A bug caught from this: putting `created_at` on a request schema (rather than only the response schema) meant a client who didn't send `created_at` would have it default to `None`, and an update using that dict would overwrite the real timestamp with null. Fields the client should never control do not belong on request schemas at all.
+ 
+ 
+## Authentication
+ 
+### Why plaintext passwords are never stored
+If the database is ever leaked or read by anyone with access, plaintext passwords would expose every user's real password immediately, and since many people reuse passwords across sites, this is a serious risk beyond just this one app. Instead, passwords are hashed before being stored.
+ 
+### Hashing (bcrypt, via passlib)
+A hash is a one way transformation, easy to compute in one direction, practically impossible to reverse. The same password always produces a related but unique hash output (bcrypt automatically incorporates a random salt, so the same password hashed twice produces two different looking hashes, which protects against precomputed lookup table attacks).
+ 
+`utils.py` is where this lives:
+* A hashing function (commonly named `hash(password)`) takes the plain password at signup and returns the bcrypt hash, which is what actually gets saved as `user.password` in the database. The real plaintext password is never stored anywhere.
+* A verify function (`utils.verify(plain_password, hashed_password)`) is used at login. It does not reverse the hash, it re-hashes the entered password using the same scheme and checks whether the result matches the stored hash. This is why login checks call `verify`, not some kind of decode.
+### Login route flow (auth.py)
+```python
+@router.post("/login", response_model=schemas.Token)
+async def login_user(user_cred: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == user_cred.username).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid credentials")
+    if not utils.verify(user_cred.password, user.password):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid credentials")
+    access_token = oauth2.create_access_token(data={'user_id': user.id})
+    return {"access_token": access_token, "token_type": 'bearer'}
+```
+ 
+Key points:
+* `OAuth2PasswordRequestForm` is a FastAPI built in dependency that expects form encoded data with exactly `username` and `password` fields (plus a few OAuth protocol fields like `grant_type`). Since this app logs in by email, the form's `.username` field is used to hold the email value, the name `username` is just the form's fixed field name, not a statement about what the value actually represents.
+* Both failure cases, user not found and wrong password, raise the exact same error with the exact same status code and message. This is intentional. If the two cases returned different responses, an attacker could tell which emails are registered just by testing logins (account enumeration). Returning identical errors either way avoids leaking that information.
+* `403 Forbidden` is used here rather than `404 Not Found`, since the login endpoint itself was found and worked fine, the credentials were what got rejected. `404` is reserved for when a specific requested resource genuinely does not exist (like `GET /posts/77` for a post id that was never created).
+* On success, only `user.id` is placed inside the token payload, not the password or other sensitive fields, since anyone can decode a JWT's payload (it is signed, not encrypted).
+## JWT (JSON Web Tokens)
+ 
+### What a JWT actually is
+A JWT is a signed string built from three parts: header, payload, and signature. The payload is just base64 encoded JSON, readable by anyone who has the token, no decryption needed. What can't be faked without the secret key is the signature. So a JWT proves "this payload was issued by someone holding the secret key and has not been altered since," it does not hide the payload's contents.
+ 
+### Creating a token (oauth2.py)
+```python
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({'exp': expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+```
+* `.copy()` avoids mutating the caller's original dict, since `to_encode.update(...)` modifies in place.
+* `exp` is added directly into the payload dict before encoding, so the expiry travels inside the token itself.
+* `jwt.encode()` takes the payload, the secret key, and a single algorithm (singular `algorithm`, since only one is used to sign) and produces the token string.
+* `datetime.now(timezone.utc)` is used instead of plain `datetime.now()` so the expiry does not depend on the server's local timezone setting.
+### Verifying a token (oauth2.py)
+```python
+def verify_access_token(token: str, credentials_exception):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        id: str = payload.get('user_id')
+        if id is None:
+            raise credentials_exception
+        token_data = schemas.TokenData(id=id)
+        return token_data
+    except JWTError:
+        raise credentials_exception
+```
+* `jwt.decode()` takes `algorithms` as a list (plural), even with only one entry, since the function is designed to accept several allowed algorithms in general, decode is more permissive by design than encode.
+* `jwt.decode()` automatically checks the signature is valid and that `exp` has not passed. If either check fails, it raises `JWTError` on its own, this is why there is no manual expiry check anywhere in this function.
+* `payload.get('user_id')` rather than `payload['user_id']` avoids a `KeyError` if the token is malformed or missing that key, returning `None` instead, which the next line checks for explicitly.
+* `schemas.TokenData(id=id)` wraps the raw id string into a small Pydantic schema (`TokenData`, with just `id: Optional[str] = None`). This is mostly for consistency with how every other piece of data in the app flows through schemas, and it gives Pydantic a chance to validate the value.
+* `credentials_exception` is passed in by the caller rather than constructed here, so this function stays generic and does not need to know exactly what status code or message the caller wants to use.
+### Turning verification into a reusable dependency
+```python
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl='login')
+ 
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail='Could not validate credentials',
+        headers={"WWW-Authenticate": "Bearer"}
+    )
+    return verify_access_token(token, credentials_exception)
+```
+* `OAuth2PasswordBearer(tokenUrl='login')` tells FastAPI where the login endpoint lives (used in the auto generated docs) and gives FastAPI a way to automatically extract the token from the `Authorization: Bearer <token>` header on incoming requests, so `token` already holds the raw string by the time the function body runs.
+* `401 Unauthorized` is used here, rather than `403`, since this represents "you did not provide valid credentials to access this at all," the standard code for missing or invalid authentication. The `WWW-Authenticate: Bearer` header is the conventional signal telling clients what kind of credential is expected.
+* This function is what gets attached to protected routes as a dependency.
+### Protecting a route
+```python
+@router.post("/", status_code=status.HTTP_201_CREATED, response_model=schemas.ResponseBase)
+async def create_post(data: schemas.CreatePost, db: Session = Depends(get_db), current_user: schemas.TokenData = Depends(oauth2.get_current_user)):
+    ...
+```
+Adding `current_user: schemas.TokenData = Depends(oauth2.get_current_user)` to a route's parameters means FastAPI runs the whole verification chain (extract token, decode, validate) before the route body executes at all. If the token is missing, expired, or invalid, the request is rejected with `401` before any of the route's own logic runs. If it succeeds, `current_user.id` holds the logged in user's id, ready to be used for things like checking post ownership before allowing an update or delete.
+ 
+### What a login session actually is here
+There is no server side session storage in this setup (no session table, no server memory of "who is logged in"). Instead, this is stateless token based authentication:
+1. Client logs in once, receives a signed token.
+2. Client stores that token (commonly in memory or local storage on the frontend) and sends it back in the `Authorization` header on every subsequent request.
+3. The server does not need to remember anything between requests, it just re-verifies the token's signature and expiry each time, using `get_current_user`.
+4. "Logging out" in this model is mostly a frontend concept, just discarding the stored token, since the server has no session to destroy. The token remains technically valid until it expires on its own.
+
