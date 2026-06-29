@@ -1,21 +1,25 @@
 from  fastapi import APIRouter,HTTPException,Depends,status
 from typing import Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from .. import models, schemas,oauth2
 from ..database import get_db
 
 router=APIRouter(prefix='/posts',tags=['Posts'])
 
-@router.get("/",response_model=list[schemas.ResponseBase])
+@router.get("/",response_model=list[schemas.PostOut])
 async def get_posts(db: Session =Depends(get_db),
                     current_user= Depends(oauth2.get_current_user),
                     limit: int=10,skip: int = 0,
                     search: Optional[str]= ""):
     
-    posts=db.query(models.Post).filter(models.Post.title.contains(search)).limit(limit).offset(skip).all() # accessing the class Post inside models.py and fetching all the records from the table posts
-    if not posts:
+    # posts=db.query(models.Post).filter(models.Post.title.contains(search)).limit(limit).offset(skip).all() # accessing the class Post inside models.py and fetching all the records from the table posts
+    # left outer join
+    results=db.query(models.Post,func.count(models.Vote.post_id).label("Votes")).join(
+        models.Vote,models.Vote.post_id==models.Post.id,isouter=True).group_by(models.Post.id).filter(models.Post.title.contains(search)).limit(limit).offset(skip).all()
+    if not results:
         raise HTTPException(status_code=404,detail='No posts found')
-    return posts
+    return results
 
 # add a dependency to see if user is logged in before creating a post
 @router.post("/",status_code=status.HTTP_201_CREATED,response_model=schemas.ResponseBase)
@@ -41,9 +45,11 @@ async def get_latest_post(db: Session = Depends(get_db),current_user= Depends(oa
         raise HTTPException(status_code=404, detail="No posts found")
     return post
         
-@router.get("/{id}",response_model=schemas.ResponseBase,)
+@router.get("/{id}",response_model=schemas.PostOut)
 async def get_post(id: int,db: Session=Depends(get_db),current_user= Depends(oauth2.get_current_user)):
-    post = db.query(models.Post).filter(models.Post.id == id).first() # .first is used to match the id and get the first record that matches the condition, to prevent code from looking for the id again after finding itonce
+    # post = db.query(models.Post).filter(models.Post.id == id).first() # .first is used to match the id and get the first record that matches the condition, to prevent code from looking for the id again after finding itonce
+    post=db.query(models.Post,func.count(models.Vote.post_id).label("Votes")).join(
+        models.Vote,models.Vote.post_id==models.Post.id,isouter=True).group_by(models.Post.id).filter(models.Post.id == id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")  
     return post

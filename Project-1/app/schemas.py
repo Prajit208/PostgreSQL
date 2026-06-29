@@ -29,6 +29,8 @@ class CreatePost(PostBase):
 class UpdatePost(PostBase):
     pass    
 
+
+
 class ResponseBase(PostBase):
     id : int
     created_at: datetime
@@ -51,3 +53,8 @@ class TokenData(BaseModel):
 class Vote(BaseModel):
     post_id: int
     dir: conint(ge=0,le=1)    
+    
+class PostOut(BaseModel):
+    Post: ResponseBase
+    Votes: int      
+    

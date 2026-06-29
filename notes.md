@@ -258,3 +258,163 @@ There is no server side session storage in this setup (no session table, no serv
 3. The server does not need to remember anything between requests, it just re-verifies the token's signature and expiry each time, using `get_current_user`.
 4. "Logging out" in this model is mostly a frontend concept, just discarding the stored token, since the server has no session to destroy. The token remains technically valid until it expires on its own.
 
+## Post ownership (authorization, not just authentication)
+
+Authentication answers "who is this." Authorization answers "is this person allowed to do this specific thing." JWT verification (`get_current_user`) only handles the first part, so without an extra check, any logged in user could edit or delete any post, not just their own, just by guessing an id in the URL.
+
+```python
+@router.delete("/{id}", status_code=204)
+async def delete_post(id: int, db: Session = Depends(get_db), current_user = Depends(oauth2.get_current_user)):
+    post = db.query(models.Post).filter(models.Post.id == id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+    db.delete(post)
+    db.commit()
+```
+
+The existence check and the ownership check are deliberately two separate `if` blocks, in that order, because they answer different questions and deserve different status codes. "Does this post exist at all" is `404`. "Does this post exist, but you don't own it" is `403`, the same forbidden code used for failed logins, since in both cases the server understood the request perfectly and is refusing it on purpose. Checking ownership before existence would mean leaking whether an id exists at all before confirming it's even real, so existence is checked first.
+
+The same two checks were copied into `update_post`, since without it, `PUT /posts/{id}` had the identical hole, any logged in user could rewrite any post's title and content.
+
+## Linking posts to users (foreign key + relationship)
+
+### The column
+```python
+from sqlalchemy import ForeignKey
+
+class Post(Base):
+    __tablename__ = "posts"
+    id = Column(Integer, primary_key=True, nullable=False)
+    owner_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    ...
+```
+`ForeignKey()` takes a string, `"users.id"`, not the `User` class itself. This is because of import order, `models.py` defines `Post` and `User` in the same file top to bottom, and writing `ForeignKey(User.id)` would require `User` to already be fully defined above `Post`, every time, in every file that ever needs this. The string form is resolved lazily by SQLAlchemy later, once all models are loaded, so the two classes don't need to know about each other's definition order at all.
+
+`nullable=False` means a post genuinely cannot exist without an owner, matching how posts actually get created, there's no code path that creates a post without a logged in user attached.
+
+### The relationship
+```python
+from sqlalchemy.orm import relationship
+
+class Post(Base):
+    ...
+    owner = relationship("User")
+```
+This adds no column to the table, it is a pure Python/ORM convenience. `owner_id` is the real, stored, queryable integer. `owner` is a virtual attribute that, when accessed (`post.owner`), tells SQLAlchemy to go fetch the matching `User` row using `owner_id` behind the scenes, so `post.owner.email` works without writing a manual join every single time. Same reasoning as `ForeignKey` for why `"User"` is a string rather than the class directly.
+
+### Reflecting ownership in the response
+
+`owner_id` was added only to `ResponseBase`, never to `PostBase`:
+```python
+class ResponseBase(PostBase):
+    id: int
+    created_at: datetime
+    owner_id: int
+    owner: UserOut
+    model_config = ConfigDict(from_attributes=True)
+```
+This was a deliberate repeat of the same lesson learned earlier with `created_at` on request schemas, `owner_id` is something the server decides, from the logged in user's token, never something the client should be allowed to send in the request body. Putting it on `PostBase` (which `CreatePost` inherits from) would mean a client could pass any `owner_id` they wanted and effectively create a post under someone else's name, since nothing downstream would reject it.
+
+`owner: UserOut` works because `from_attributes=True` lets Pydantic walk `post.owner.email`, `post.owner.id` etc. directly off the SQLAlchemy object graph, the same mechanism that already let `ResponseBase` read plain attributes like `post.title`.
+
+Creating the post now sets the owner explicitly:
+```python
+new_post = models.Post(owner_id=current_user.id, **data.model_dump())
+```
+`current_user.id` and `**data.model_dump()` can sit side by side in the same constructor call because there's no key collision between them, `data.model_dump()` only ever produces `title`, `content`, `published`, never `owner_id`, since it was deliberately kept off `CreatePost`.
+
+## Query parameters
+
+Any function parameter on a route that is not a path parameter (not inside `{}`) and not a Pydantic model is automatically read by FastAPI from the URL's query string.
+
+```python
+@router.get("/", response_model=list[schemas.PostOut])
+async def get_posts(db: Session = Depends(get_db),
+                     current_user = Depends(oauth2.get_current_user),
+                     limit: int = 10,
+                     skip: int = 0,
+                     search: Optional[str] = ""):
+```
+`limit` and `skip` together implement pagination, `LIMIT` caps how many rows come back, `OFFSET` (via `.offset(skip)`) skips past however many rows were already seen on previous pages. `search` defaults to an empty string rather than `None` specifically because `.contains("")` matches every row, giving "no filter" behavior for free without needing a separate branch to handle the unfiltered case.
+
+## Counting votes with a join
+
+Goal: each post's vote count, in one query, rather than running a separate count query per post (an N+1 query pattern, one extra round trip to the database per post returned).
+
+```python
+from sqlalchemy import func
+
+results = db.query(models.Post, func.count(models.Vote.post_id).label("Votes")).join(
+    models.Vote, models.Vote.post_id == models.Post.id, isouter=True
+).group_by(models.Post.id).filter(models.Post.title.contains(search)).limit(limit).offset(skip).all()
+```
+* `func.count(...)` is a SQL aggregate, computed by the database, not by pulling rows into Python and counting there.
+* `.label("Votes")` names this computed column. The exact string given here has to match a field name on the schema used to parse the result (below), since that's literally how Pydantic finds it.
+* `isouter=True` makes this a LEFT OUTER JOIN rather than the default inner join. This matters specifically for posts with zero votes, an inner join only returns rows that have at least one match on both sides, so a post with no votes at all would simply vanish from the results instead of showing a count of 0.
+* `.group_by(models.Post.id)` is required any time an aggregate function (`func.count`) is selected alongside non-aggregated columns (the full `Post` row), the database needs an explicit grouping to know which rows to count together.
+
+### Response_model expecting a flat object, getting a tuple
+
+`db.query(models.Post, func.count(...))` selects two things, so each row that comes back is a `Row` object behaving like `(Post_instance, count)`, not a flat object with `.title` directly on it. Returning this against `response_model=list[schemas.ResponseBase]` produced 30 validation errors, every field on every row reported as "missing," since Pydantic was trying to read `.title`, `.id` etc. straight off a tuple-like object that doesn't have them at that level.
+
+The fix was a new schema shaped to match what the row actually contains:
+```python
+class PostOut(BaseModel):
+    Post: ResponseBase
+    Votes: int
+```
+The field name `Post` matches the class name SQLAlchemy gives the row's first selected entity by default. The field name `Votes` matches the `.label("Votes")` given to the count column. Pydantic, given `from_attributes` behavior, can read named attributes off a `Row` the same way it reads them off a model instance, so naming the schema's fields to exactly match is what makes the parsing work.
+
+## Votes feature (many to many via a join table)
+
+A user can vote on many posts, a post can receive votes from many users, this is a many to many relationship, modeled with a separate table that holds pairs of foreign keys rather than adding columns to either `Post` or `User` directly.
+
+```python
+class Vote(Base):
+    __tablename__ = "votes"
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"), primary_key=True)
+```
+There is no separate `id` column here, `user_id` and `post_id` together form a composite primary key, meaning the database itself enforces that a given (user, post) pair can only ever appear once, exactly the constraint needed so a user can't vote on the same post twice. `ondelete="CASCADE"` means if the referenced user or post is ever deleted, any vote rows pointing at it are deleted automatically too, instead of being left behind as orphaned rows referencing something that no longer exists.
+
+```python
+from pydantic import conint
+
+class Vote(BaseModel):
+    post_id: int
+    dir: conint(ge=0, le=1)
+```
+`conint(ge=0, le=1)` is a constrained integer, bounded on both sides, restricting `dir` to exactly `0` or `1`. An earlier version only set `le=1`, which let through `0`, `-1`, `-500`, anything at or below 1, since `le` alone only bounds one side.
+
+### The route, four cases
+
+```python
+@router.post("/", status_code=status.HTTP_201_CREATED)
+async def vote_post(vote: schemas.Vote, db: Session = Depends(get_db), current_user = Depends(oauth2.get_current_user)):
+    post = db.query(models.Post).filter(models.Post.id == vote.post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    found_vote = db.query(models.Vote).filter(
+        models.Vote.post_id == post.id, models.Vote.user_id == current_user.id
+    ).first()
+
+    if vote.dir == 1:
+        if found_vote:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                                 detail=f"user {current_user.id} has already voted on post {vote.post_id}")
+        new_vote = models.Vote(post_id=vote.post_id, user_id=current_user.id)
+        db.add(new_vote)
+        db.commit()
+        return {"message": "successfully added vote"}
+    else:
+        if not found_vote:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vote does not exist")
+        db.delete(found_vote)
+        db.commit()
+        return {"message": "successfully deleted vote"}
+```
+`dir == 1` means cast a vote, `dir == 0` means remove one, and each of those two cases has its own success path and its own failure path, four cases total. `409 Conflict` is used for "you already voted," since the request is well formed and the user is allowed to vote in general, the conflict is specifically that this exact (user, post) pair already exists. `404` is used for "no vote to remove," consistent with how `404` is used everywhere else in this project, for "the specific thing you're trying to act on doesn't exist."
+

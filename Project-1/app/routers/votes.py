@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas,utils,oauth2
 from ..database import get_db
 
-router=APIRouter(prefix="/vote",tag=["Votes"])
+router=APIRouter(prefix="/vote",tags=["Votes"])
 
 @router.post("/",status_code=status.HTTP_201_CREATED)
 async def vote_post(vote: schemas.Vote,db: Session= Depends(get_db),current_user=Depends(oauth2.get_current_user)):
