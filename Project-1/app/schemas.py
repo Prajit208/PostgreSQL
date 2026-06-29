@@ -1,32 +1,7 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict,EmailStr
+from pydantic import BaseModel, ConfigDict,EmailStr, conint
 from typing import Optional
 
-# class Post(BaseModel):
-#     title: str
-#     content: str
-#     published: bool=True
-    
-# class CreatePost(BaseModel):
-#     title: str
-#     content: str
-#     published: bool=True    
-    
-# class UpdatePost(BaseModel):
-#     title: str
-#     content: str
-#     published: bool     
-    
-    # for simple application like this, 
-    # these multiple classes my be redundant, 
-    # but as app gets complex these will have 
-    # slighlty different request and response 
-    # format based on action, so multiple schemas 
-    # are used to keep the code clean and organized.
-    
-    
-    # Or instead of makeing multiple classes just use inheritance
-  
 class UserBase(BaseModel):
     email: EmailStr
       
@@ -48,7 +23,6 @@ class PostBase(BaseModel):
     content: str
     published: bool = True
    
-
 class CreatePost(PostBase):
     pass
 
@@ -67,12 +41,13 @@ class ResponseBase(PostBase):
     # off an object's attributes instead, e.g. new_post.title, new_post.content
     # this is what lets us return a raw SQLAlchemy model instance (new_post) from the
     # route and have FastAPI correctly convert it into this response schema
-    
-
-    
 class Token(BaseModel):
     access_token: str
     token_type: str
     
 class TokenData(BaseModel):
     id: Optional[int]=None        
+    
+class Vote(BaseModel):
+    post_id: int
+    dir: conint(ge=0,le=1)    

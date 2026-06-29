@@ -1,28 +1,26 @@
 from  fastapi import APIRouter,HTTPException,Depends,status
+from typing import Optional
 from sqlalchemy.orm import Session
 from .. import models, schemas,oauth2
 from ..database import get_db
 
 router=APIRouter(prefix='/posts',tags=['Posts'])
 
-
-
 @router.get("/",response_model=list[schemas.ResponseBase])
 async def get_posts(db: Session =Depends(get_db),
                     current_user= Depends(oauth2.get_current_user),
-                    limit: int=10):
+                    limit: int=10,skip: int = 0,
+                    search: Optional[str]= ""):
     
-    posts=db.query(models.Post).limit(limit).all() # accessing the class Post inside models.py and fetching all the records from the table posts
+    posts=db.query(models.Post).filter(models.Post.title.contains(search)).limit(limit).offset(skip).all() # accessing the class Post inside models.py and fetching all the records from the table posts
     if not posts:
         raise HTTPException(status_code=404,detail='No posts found')
     return posts
 
-# adda dependency to see if user is logged in before creating a post
+# add a dependency to see if user is logged in before creating a post
 @router.post("/",status_code=status.HTTP_201_CREATED,response_model=schemas.ResponseBase)
 async def create_post(data: schemas.CreatePost,db: Session=Depends(get_db),current_user= Depends(oauth2.get_current_user)):   
-    
-    
-     
+
     new_post=models.Post(owner_id=current_user.id,** data.model_dump())# Just creating an instance of the class Post and passing the values to it
     db.add(new_post) # adding the new_post to the database session
     db.commit()# commit the changes
@@ -68,9 +66,7 @@ async def update_post(id: int,data: schemas.UpdatePost,db : Session =Depends(get
 #   the SQL SET title=..., content=..., published=... from it
 # synchronize_session=False tells SQLAlchemy not to bother syncing this 
 #   change with any Post objects already loaded in memory in this session 
-#   (faster, since we don't need that here)
-    print(update_post)
-    
+#   (faster, since we don't need that here)  
     if not update_post:
         raise HTTPException(status_code=404,detail="Post not found")
     if update_post.owner_id != current_user.id:
